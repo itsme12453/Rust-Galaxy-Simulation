@@ -3,14 +3,15 @@ use bevy::input::mouse::{ MouseMotion, MouseWheel };
 use bevy::math::{ Quat, Vec3 };
 use bevy::prelude::*;
 use rand::Rng;
+use rayon::prelude::*;
 
 const NUM_PARTICLES_PER_GALAXY: usize = 10_000;
 const PARTICLE_RADIUS: f32 = 0.01;
 const GALAXY_RADIUS: f32 = 5.0;
 const GALAXY_SPACING: f32 = 10.0;
 const GALAXY_COUNT: usize = 2;
-const G: f32 = 30.0;
-const DT: f32 = 0.00001;
+const G: f32 = 1.0;
+const DT: f32 = 0.0001;
 const PARTICLE_MASS: f32 = 1.0;
 const CENTRAL_MASS: f32 = 5e6;
 const THETA: f32 = 0.8; // Barnes-Hut opening angle threshold
@@ -83,7 +84,7 @@ fn spawn_n_galaxies(
         let tangent = Vec3::new(-z, 0.0, x).normalize_or_zero();
         let mut velocity = tangent * orbital_speed;
 
-        velocity = Vec3::new(0.0, 0.0, 0.0);
+        // velocity = Vec3::new(0.0, 0.0, 0.0);
 
         spawn_galaxy(
             center_offset,
@@ -106,7 +107,7 @@ fn setup(
 ) {
     let mut rng = rand::thread_rng();
 
-    let galaxy_speed = 0.0;
+    let galaxy_speed = 30.0;
 
     spawn_n_galaxies(
         GALAXY_COUNT,
@@ -200,6 +201,8 @@ fn spawn_galaxy(
         ..default()
     });
 
+    // let rand_mass: f32 = rng.gen_range(15e6..30e6);
+
     commands.spawn((
         PbrBundle {
             mesh: cen_mesh.clone(),
@@ -239,6 +242,27 @@ fn spawn_galaxy(
 
 const MIN_CELL_SIZE: f32 = PARTICLE_RADIUS * 0.5;
 
+struct BHNodeArena {
+    nodes: Vec<BHNode>,
+}
+
+impl BHNodeArena {
+    fn new() -> Self {
+        Self { nodes: Vec::with_capacity(1024) }
+    }
+    fn alloc(&mut self, node: BHNode) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(node);
+        idx
+    }
+    fn get(&self, idx: usize) -> &BHNode {
+        &self.nodes[idx]
+    }
+    fn get_mut(&mut self, idx: usize) -> &mut BHNode {
+        &mut self.nodes[idx]
+    }
+}
+
 #[derive(Default)]
 enum BHNode {
     /// No particles
@@ -254,7 +278,7 @@ enum BHNode {
     Internal {
         center: Vec3,
         mass: f32,
-        children: [Box<BHNode>; 8],
+        children: [Option<usize>; 8],
     },
 }
 
@@ -264,7 +288,7 @@ impl BHNode {
         BHNode::Internal {
             center: Vec3::ZERO,
             mass: 0.0,
-            children: std::array::from_fn(|_| Box::new(BHNode::Empty)),
+            children: [None; 8],
         }
     }
 }
@@ -272,107 +296,161 @@ impl BHNode {
 fn build_bh_tree(
     particles: &[(Entity, Vec3, f32)],
     region_center: Vec3,
-    region_half: f32
-) -> BHNode {
-    let mut root = BHNode::new_internal();
+    region_half: f32,
+    arena: &mut BHNodeArena
+) -> usize {
+    let root_idx = arena.alloc(BHNode::new_internal());
     for &(entity, pos, mass) in particles {
-        insert(&mut root, region_center, region_half, entity, pos, mass);
+        insert(root_idx, region_center, region_half, entity, pos, mass, arena);
     }
-    root
+    root_idx
 }
 
 fn insert(
-    node: &mut BHNode,
+    node_idx: usize,
     region_center: Vec3,
     region_half: f32,
     entity: Entity,
     pos: Vec3,
-    mass: f32
+    mass: f32,
+    arena: &mut BHNodeArena
 ) {
-    // If the cell is already too small to subdivide, just accumulate into this node
-    if region_half < MIN_CELL_SIZE {
-        match node {
-            BHNode::Empty => {
-                *node = BHNode::Leaf {
-                    center: pos,
-                    mass,
-                    entity,
-                };
-            }
-            | BHNode::Leaf { center: c, mass: m, .. }
-            | BHNode::Internal { center: c, mass: m, .. } => {
-                // update center of mass
-                *c = (*c * *m + pos * mass) / (*m + mass);
-                *m += mass;
+    let need_accumulate = region_half < MIN_CELL_SIZE;
+    if need_accumulate {
+        {
+            let node = arena.get_mut(node_idx);
+            match node {
+                BHNode::Empty => {
+                    *node = BHNode::Leaf { center: pos, mass, entity };
+                }
+                | BHNode::Leaf { center: c, mass: m, .. }
+                | BHNode::Internal { center: c, mass: m, .. } => {
+                    *c = (*c * *m + pos * mass) / (*m + mass);
+                    *m += mass;
+                }
             }
         }
         return;
     }
 
-    match node {
-        BHNode::Empty => {
-            *node = BHNode::Leaf {
-                center: pos,
-                mass,
-                entity,
-            };
+    // Determine node type, then drop the mutable borrow
+    let node_type = {
+        let node = arena.get_mut(node_idx);
+        match node {
+            BHNode::Empty => 0,
+            BHNode::Leaf { .. } => 1,
+            BHNode::Internal { .. } => 2,
         }
-        BHNode::Leaf { center: c, mass: m, entity: e } => {
-            // subdivide leaf into internal
-            let old_pos = *c;
-            let old_mass = *m;
-            let old_entity = *e;
-            *node = BHNode::new_internal();
-            if let BHNode::Internal { center, mass: total_mass, children } = node {
-                // update COM for the two particles
-                *center = (old_pos * old_mass + pos * mass) / (old_mass + mass);
-                *total_mass = old_mass + mass;
+    };
 
-                // re-insert both
-                for &(ent, p, ma) in &[
-                    (old_entity, old_pos, old_mass),
-                    (entity, pos, mass),
-                ] {
-                    let idx = child_index(region_center, p);
-                    let offset = child_offset(region_half, idx);
-                    insert(
-                        &mut children[idx],
-                        region_center + offset,
-                        region_half * 0.5,
-                        ent,
-                        p,
-                        ma
-                    );
+    match node_type {
+        0 => {
+            let node = arena.get_mut(node_idx);
+            *node = BHNode::Leaf { center: pos, mass, entity };
+        }
+        1 => {
+            // Extract old values, then drop the borrow
+            let (old_pos, old_mass, old_entity) = {
+                let node = arena.get_mut(node_idx);
+                if let BHNode::Leaf { center, mass, entity } = node {
+                    (*center, *mass, *entity)
+                } else {
+                    unreachable!()
+                }
+            };
+            // Replace with internal
+            {
+                let node = arena.get_mut(node_idx);
+                *node = BHNode::new_internal();
+            }
+            // Update COM and mass
+            {
+                let node = arena.get_mut(node_idx);
+                if let BHNode::Internal { center, mass: m, .. } = node {
+                    *center = (old_pos * old_mass + pos * mass) / (old_mass + mass);
+                    *m = old_mass + mass;
                 }
             }
+            // Insert both particles
+            for &(ent, p, ma) in &[(old_entity, old_pos, old_mass), (entity, pos, mass)] {
+                let idx = child_index(region_center, p);
+                let offset = child_offset(region_half, idx);
+                
+                let child_idx = {
+                    let mut need_alloc = false;
+                    {
+                        let node = arena.get_mut(node_idx);
+                        if let BHNode::Internal { children, .. } = node {
+                            if children[idx].is_none() {
+                                need_alloc = true;
+                            }
+                        }
+                    }
+                    if need_alloc {
+                        let new_idx = arena.alloc(BHNode::Empty);
+                        let node = arena.get_mut(node_idx);
+                        if let BHNode::Internal { children, .. } = node {
+                            children[idx] = Some(new_idx);
+                        }
+                    }
+                    let node = arena.get_mut(node_idx);
+                    if let BHNode::Internal { children, .. } = node {
+                        children[idx].unwrap()
+                    } else {
+                        unreachable!()
+                    }
+                };
+                insert(child_idx, region_center + offset, region_half * 0.5, ent, p, ma, arena);
+            }
         }
-        BHNode::Internal { center: com, mass: total_mass, children } => {
-            // update COM & mass
-            *com = (*com * *total_mass + pos * mass) / (*total_mass + mass);
-            *total_mass += mass;
-            // descend into the appropriate child
+        2 => {
+            // Update COM and mass
+            {
+                let node = arena.get_mut(node_idx);
+                if let BHNode::Internal { center, mass: m, .. } = node {
+                    *center = (*center * *m + pos * mass) / (*m + mass);
+                    *m += mass;
+                }
+            }
             let idx = child_index(region_center, pos);
             let offset = child_offset(region_half, idx);
-            insert(
-                &mut children[idx],
-                region_center + offset,
-                region_half * 0.5,
-                entity,
-                pos,
-                mass
-            );
+            
+            let child_idx = {
+                let mut need_alloc = false;
+                {
+                    let node = arena.get_mut(node_idx);
+                    if let BHNode::Internal { children, .. } = node {
+                        if children[idx].is_none() {
+                            need_alloc = true;
+                        }
+                    }
+                }
+                if need_alloc {
+                    let new_idx = arena.alloc(BHNode::Empty);
+                    let node = arena.get_mut(node_idx);
+                    if let BHNode::Internal { children, .. } = node {
+                        children[idx] = Some(new_idx);
+                    }
+                }
+                let node = arena.get_mut(node_idx);
+                if let BHNode::Internal { children, .. } = node {
+                    children[idx].unwrap()
+                } else {
+                    unreachable!()
+                }
+            };
+            insert(child_idx, region_center + offset, region_half * 0.5, entity, pos, mass, arena);
         }
+        _ => unreachable!(),
     }
 }
 
-/// Octant selection
 fn child_index(center: Vec3, pos: Vec3) -> usize {
     ((pos.x > center.x) as usize) |
         (((pos.y > center.y) as usize) << 1) |
         (((pos.z > center.z) as usize) << 2)
 }
 
-/// Octant offset
 fn child_offset(half: f32, idx: usize) -> Vec3 {
     Vec3::new(
         if (idx & 1) == 0 {
@@ -393,9 +471,8 @@ fn child_offset(half: f32, idx: usize) -> Vec3 {
     )
 }
 
-/// Compute acceleration from tree
-fn compute_acc(node: &BHNode, pos: Vec3, region_center: Vec3, region_half: f32) -> Vec3 {
-    match node {
+fn compute_acc(arena: &BHNodeArena, node_idx: usize, pos: Vec3, region_center: Vec3, region_half: f32) -> Vec3 {
+    match arena.get(node_idx) {
         BHNode::Empty => Vec3::ZERO,
         BHNode::Leaf { center: c, mass: m, .. } => {
             let d = *c - pos;
@@ -412,11 +489,10 @@ fn compute_acc(node: &BHNode, pos: Vec3, region_center: Vec3, region_half: f32) 
             } else {
                 let mut acc = Vec3::ZERO;
                 for (i, child) in children.iter().enumerate() {
-                    if let BHNode::Empty = **child {
-                        continue;
+                    if let Some(child_idx) = child {
+                        let offset = child_offset(region_half, i);
+                        acc += compute_acc(arena, *child_idx, pos, region_center + offset, region_half * 0.5);
                     }
-                    let offset = child_offset(region_half, i);
-                    acc += compute_acc(child, pos, region_center + offset, region_half * 0.5);
                 }
                 acc
             }
@@ -431,10 +507,14 @@ fn apply_gravity(mut q: Query<(Entity, &Transform, &Mass, &mut Acceleration)>) {
         .collect();
     let region_center = Vec3::ZERO;
     let region_half = GALAXY_SPACING * 10.0;
-    let tree = build_bh_tree(&data, region_center, region_half);
-    for (_e, t, _m, mut a) in q.iter_mut() {
-        a.0 = compute_acc(&tree, t.translation, region_center, region_half);
-    }
+    let mut arena = BHNodeArena::new();
+    let root_idx = build_bh_tree(&data, region_center, region_half, &mut arena);
+    q.par_iter_mut().for_each(|(_e, t, _m, mut a)| {
+        a.0 = compute_acc(&arena, root_idx, t.translation, region_center, region_half);
+    });
+    // for (_e, t, _m, mut a) in q.iter_mut() {
+    //     a.0 = compute_acc(&tree, t.translation, region_center, region_half);
+    // }
 }
 
 fn leapfrog_update(mut q: Query<(&mut Transform, &mut Velocity, &Acceleration)>) {
@@ -536,7 +616,7 @@ fn check_central_star_collision(
                 material: ring_mat.clone(),
             },
         ));
-        
+
         let fusion_mesh = meshes.add(
             Mesh::from(shape::UVSphere {
                 radius: 0.15,
