@@ -5,11 +5,11 @@ use bevy::prelude::*;
 use rand::Rng;
 use rayon::prelude::*;
 
-const NUM_PARTICLES_PER_GALAXY: usize = 10_000;
+const NUM_PARTICLES_PER_GALAXY: usize = 70_000;
 const PARTICLE_RADIUS: f32 = 0.01;
 const GALAXY_RADIUS: f32 = 5.0;
 const GALAXY_SPACING: f32 = 10.0;
-const GALAXY_COUNT: usize = 2;
+const GALAXY_COUNT: usize = 1;
 const G: f32 = 1.0;
 const DT: f32 = 0.0001;
 const PARTICLE_MASS: f32 = 1.0;
@@ -84,7 +84,7 @@ fn spawn_n_galaxies(
         let tangent = Vec3::new(-z, 0.0, x).normalize_or_zero();
         let mut velocity = tangent * orbital_speed;
 
-        // velocity = Vec3::new(0.0, 0.0, 0.0);
+        velocity = Vec3::new(0.0, 0.0, 0.0);
 
         spawn_galaxy(
             center_offset,
@@ -107,7 +107,7 @@ fn setup(
 ) {
     let mut rng = rand::thread_rng();
 
-    let galaxy_speed = 30.0;
+    let galaxy_speed = 0.0;
 
     spawn_n_galaxies(
         GALAXY_COUNT,
@@ -304,6 +304,111 @@ fn build_bh_tree(
         insert(root_idx, region_center, region_half, entity, pos, mass, arena);
     }
     root_idx
+}
+
+fn partition_particles(
+    particles: &[(Entity, Vec3, f32)],
+    region_center: Vec3,
+) -> [Vec<(Entity, Vec3, f32)>; 8] {
+    let mut buckets: [Vec<(Entity, Vec3, f32)>; 8] = Default::default();
+    for &(e, p, m) in particles {
+        let idx = child_index(region_center, p);
+        buckets[idx].push((e, p, m));
+    }
+    buckets
+}
+
+fn build_bh_tree_parallel(
+    particles: &[(Entity, Vec3, f32)],
+    region_center: Vec3,
+    region_half: f32,
+    arena: &mut BHNodeArena,
+) -> usize {
+    if particles.len() <= 1000 || region_half < MIN_CELL_SIZE {
+        // Fallback to sequential for small sets or tiny regions
+        return build_bh_tree(particles, region_center, region_half, arena);
+    }
+    let buckets = partition_particles(particles, region_center);
+    // Each thread gets its own arena
+    let subtrees: Vec<(Vec<BHNode>, Option<usize>)> = buckets
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, bucket)| {
+            if bucket.is_empty() {
+                (Vec::new(), None)
+            } else {
+                let mut local_arena = BHNodeArena { nodes: Vec::new() };
+                let offset = child_offset(region_half, i);
+                let idx = build_bh_tree(&bucket, region_center + offset, region_half * 0.5, &mut local_arena);
+                (local_arena.nodes, Some(idx))
+            }
+        })
+        .collect();
+    // Merge all sub-arenas into the main arena, updating indices
+    let mut children_idxs = [None; 8];
+    let mut node_offset = arena.nodes.len();
+    let mut idx_map: Vec<Vec<usize>> = Vec::with_capacity(8);
+    for (nodes, idx_opt) in &subtrees {
+        let mut map = Vec::with_capacity(nodes.len());
+        for _ in 0..nodes.len() {
+            map.push(arena.nodes.len());
+            arena.nodes.push(BHNode::Empty); // placeholder
+        }
+        idx_map.push(map);
+    }
+    // Copy nodes and update child indices
+    for (octant, (nodes, idx_opt)) in subtrees.iter().enumerate() {
+        let map = &idx_map[octant];
+        for (old_idx, node) in nodes.iter().enumerate() {
+            let new_idx = map[old_idx];
+            let new_node = match node {
+                BHNode::Internal { center, mass, children } => {
+                    let mut new_children = [None; 8];
+                    for (i, child) in children.iter().enumerate() {
+                        if let Some(child_idx) = child {
+                            new_children[i] = Some(map[*child_idx]);
+                        }
+                    }
+                    BHNode::Internal {
+                        center: *center,
+                        mass: *mass,
+                        children: new_children,
+                    }
+                }
+                BHNode::Leaf { center, mass, entity } => {
+                    BHNode::Leaf { center: *center, mass: *mass, entity: *entity }
+                }
+                BHNode::Empty => BHNode::Empty,
+            };
+            arena.nodes[new_idx] = new_node;
+        }
+        if let Some(idx) = idx_opt {
+            children_idxs[octant] = Some(map[*idx]);
+        }
+    }
+    // Compute center of mass and total mass
+    let mut center = Vec3::ZERO;
+    let mut mass = 0.0;
+    for &child_idx in &children_idxs {
+        if let Some(idx) = child_idx {
+            match &arena.nodes[idx] {
+                BHNode::Internal { center: c, mass: m, .. }
+                | BHNode::Leaf { center: c, mass: m, .. } => {
+                    center += *c * *m;
+                    mass += *m;
+                }
+                _ => {}
+            }
+        }
+    }
+    if mass > 0.0 {
+        center /= mass;
+    }
+    arena.alloc(BHNode::Internal {
+        center,
+        mass,
+        children: children_idxs,
+    })
 }
 
 fn insert(
@@ -508,7 +613,11 @@ fn apply_gravity(mut q: Query<(Entity, &Transform, &Mass, &mut Acceleration)>) {
     let region_center = Vec3::ZERO;
     let region_half = GALAXY_SPACING * 10.0;
     let mut arena = BHNodeArena::new();
-    let root_idx = build_bh_tree(&data, region_center, region_half, &mut arena);
+    let root_idx = if data.len() > 2000 {
+        build_bh_tree_parallel(&data, region_center, region_half, &mut arena)
+    } else {
+        build_bh_tree(&data, region_center, region_half, &mut arena)
+    };
     q.par_iter_mut().for_each(|(_e, t, _m, mut a)| {
         a.0 = compute_acc(&arena, root_idx, t.translation, region_center, region_half);
     });
