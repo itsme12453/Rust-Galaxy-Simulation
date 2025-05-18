@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use rand::Rng;
 use rayon::prelude::*;
 
-const NUM_PARTICLES_PER_GALAXY: usize = 70_000;
+const NUM_PARTICLES_PER_GALAXY: usize = 100_000;
 const PARTICLE_RADIUS: f32 = 0.01;
 const GALAXY_RADIUS: f32 = 5.0;
 const GALAXY_SPACING: f32 = 10.0;
